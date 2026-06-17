@@ -8,3 +8,12 @@ web/package-lock.json linguist-generated=true
 Dockerfile  text eol=lf
 *.dockerfile text eol=lf
 docker/entrypoint.sh text eol=lf
+
+# ── JARVIS fork: brand-only files ────────────────────────────────────────
+# These files do not exist in upstream Hermes. `merge=ours` keeps our copy
+# on any conflict (only relevant if upstream ever adds same-named files).
+# The driver must be enabled once per clone (it cannot be committed):
+#   git config merge.ours.driver true
+# See docs/JARVIS-FORK-MAINTENANCE.md for the full update workflow.
+web/src/jarvis-overrides.css      merge=ours
+web/src/themes/jarvis-glassify.ts merge=ours
