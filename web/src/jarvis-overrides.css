@@ -58,3 +58,110 @@ body {
 .bg-card {
   border-radius: 0.75rem;
 }
+
+/* ==================================================================== */
+/* Tier 2 — page-body polish.                                           */
+/*                                                                      */
+/* Global rules that modernize the page *contents* (not just the        */
+/* chrome), keyed on element + DS-class hooks so they lift all ~19      */
+/* pages at once. Kept here in the brand-only file — no per-page edits, */
+/* so upstream merges stay clean.                                       */
+/* ==================================================================== */
+
+/* Text selection — champagne accent with dark text for contrast. */
+::selection {
+  background: color-mix(in srgb, var(--color-ring, #c9a86a) 38%, transparent);
+  color: var(--background-base, #0a0b0f);
+}
+
+/* Refined scrollbars for the dashboard's many scroll panes (lists, logs,
+   config). Thin, track-less, with a subtle thumb that brightens on hover. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--midground-base) 22%, transparent)
+    transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--midground-base) 18%, transparent);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--midground-base) 34%, transparent);
+  background-clip: padding-box;
+}
+
+/* Keyboard focus — one consistent champagne ring across the app. The
+   offset keeps it clear of any inner ring a DS component draws. */
+:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-ring, #c9a86a) 70%, transparent);
+  outline-offset: 2px;
+}
+
+/* Form controls — round the corners, drop the terminal Courier face for
+   the sans stack, and give a soft accent focus ring instead of a hard
+   outline. The `.font-courier` override is scoped to form elements so
+   code/data readouts elsewhere keep their mono face. */
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+textarea,
+select {
+  border-radius: 0.5rem;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+input.font-courier,
+textarea.font-courier,
+select.font-courier {
+  font-family: var(--theme-font-sans);
+}
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: none;
+  border-color: color-mix(in srgb, var(--color-ring, #c9a86a) 55%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-ring, #c9a86a) 18%, transparent);
+}
+
+/* Badges → pills. The DS <Badge> renders square + uppercase with very wide
+   0.2em tracking (a terminal stamp). `font-compressed` is unique to badges
+   among DS components (buttons/stats don't use it), so this combo targets
+   badges only: round to a full pill and tame the tracking. */
+.font-compressed.text-display {
+  border-radius: 9999px;
+  letter-spacing: 0.08em;
+}
+
+/* Tables (Analytics) — comfortable cells, an uppercase hairline header, and
+   a subtle row hover so dense numeric grids read as a designed table. */
+table {
+  border-collapse: collapse;
+}
+th,
+td {
+  padding: 0.625rem 0.875rem;
+}
+thead th {
+  font-size: 0.6875rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-muted-foreground);
+  border-bottom: 1px solid var(--color-border);
+}
+tbody tr {
+  border-bottom: 1px solid color-mix(in srgb, var(--color-border) 60%, transparent);
+}
+tbody tr:hover {
+  background: color-mix(in srgb, var(--midground-base) 4%, transparent);
+}
+
+/* Links — smooth color transitions on hover for a polished feel. */
+a {
+  transition: color 0.15s ease, opacity 0.15s ease;
+}
