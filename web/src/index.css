@@ -145,6 +145,35 @@ body {
   font-feature-settings: "ss01", "cv01", "liga", "calt";
 }
 
+/* ------------------------------------------------------------------ */
+/* Retire the Hermes pixel/terminal display faces globally.            */
+/* The Nous DS resolves its `font-mondwest` / `font-expanded` /        */
+/* `font-compressed` utilities through these vars; remapping them to   */
+/* the active theme's display + sans stacks modernizes every page that */
+/* uses those utilities (badges, labels, page titles, section heads —  */
+/* ~60 call sites) in one place, without editing each page. The        */
+/* `text-display` uppercase+tracking treatment stays, which now reads  */
+/* as a refined luxury label instead of a pixel-font stamp.            */
+/* This block comes after the DS import so it wins the cascade.        */
+/* ------------------------------------------------------------------ */
+:root {
+  --font-mondwest: var(--theme-font-display);
+  --font-rules-expanded: var(--theme-font-display);
+  --font-rules-compressed: var(--theme-font-sans);
+}
+
+/* Modern surfaces: pages build panels from `bg-card` + `border-border`
+   with hard square corners (the dense console look). Give every
+   card-backed surface soft corners by default so dropdowns, dialogs,
+   list rows, and section panels read as lifted glass cards. Borders are
+   already routed through the theme's translucent `--color-border`, and
+   the active theme's customCSS frosts these same surfaces with a blur +
+   subtle shadow — together they become the rounded glass panels the
+   shell uses. */
+.bg-card {
+  border-radius: 0.75rem;
+}
+
 #root {
   min-height: 0;
   height: 100%;
