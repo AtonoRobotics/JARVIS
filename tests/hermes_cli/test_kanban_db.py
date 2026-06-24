@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 import types
@@ -1918,15 +1919,146 @@ def test_dir_workspace_honors_given_path(kanban_home, tmp_path):
 
 
 def test_worktree_workspace_returns_intended_path(kanban_home, tmp_path):
-    target = str(tmp_path / ".worktrees" / "my-task")
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = tmp_path / ".worktrees" / "my-task"
+    kb.write_board_metadata("default", default_workdir=str(repo))
     with kb.connect() as conn:
         t = kb.create_task(
-            conn, title="ship", workspace_kind="worktree", workspace_path=target
+            conn,
+            title="ship",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="wt/resolve-worktree-test",
         )
         task = kb.get_task(conn, t)
-        ws = kb.resolve_workspace(task)
-    # We do NOT auto-create worktrees; the worker's skill handles that.
-    assert str(ws) == target
+        assert task is not None
+        ws = kb.resolve_workspace(task, board="default")
+    assert ws == target
+    assert _git_toplevel_for_test(target) == target
+
+
+def _init_git_repo(path: Path) -> None:
+    path.mkdir()
+    subprocess.run(["git", "init"], cwd=path, check=True, stdout=subprocess.PIPE)
+    subprocess.run(
+        ["git", "config", "user.email", "kanban-test@example.com"],
+        cwd=path,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Kanban Test"],
+        cwd=path,
+        check=True,
+    )
+    (path / "README.md").write_text("root\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=path, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"],
+        cwd=path,
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+
+
+def _git_toplevel_for_test(path: Path) -> Path:
+    return Path(
+        subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+    )
+
+
+def test_dispatch_creates_missing_worktree_from_board_default_workdir(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    """A worktree task with a missing path must be made spawn-safe before spawn.
+
+    This exercises the production dispatcher/workspace path with a real git
+    repository and a real ``git worktree add``. The worker must not be spawned
+    into a missing/non-git directory and then bounce through spawn_failed.
+    """
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = tmp_path / "worktrees" / "task-branch"
+    spawns: list[tuple[str, str]] = []
+
+    def record_spawn(task, workspace):
+        spawns.append((task.id, workspace))
+        assert Path(workspace) == target
+        assert (target / ".git").exists()
+        top = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "--show-toplevel"],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+        assert Path(top) == target
+
+    kb.write_board_metadata("default", default_workdir=str(repo))
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="ship worktree",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="wt/kanban-worktree-test",
+        )
+        result = kb.dispatch_once(conn, spawn_fn=record_spawn, board="default")
+        task = kb.get_task(conn, t)
+        assert task is not None
+        events = kb.list_events(conn, t)
+
+    assert result.spawned == [(t, "alice", str(target))]
+    assert spawns == [(t, str(target))]
+    assert task.status == "running"
+    assert task.workspace_path == str(target)
+    assert "spawn_failed" not in [event.kind for event in events]
+
+
+def test_dispatch_blocks_existing_non_worktree_path_before_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    """An existing non-root worktree path is a preflight blocker, not a retry loop."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = tmp_path / "worktrees" / "not-a-worktree"
+    target.mkdir(parents=True)
+    (target / "artifact.txt").write_text("do not overwrite\n", encoding="utf-8")
+
+    def should_not_spawn(task, workspace):  # pragma: no cover - must not run
+        raise AssertionError("dispatcher spawned despite invalid worktree path")
+
+    kb.write_board_metadata("default", default_workdir=str(repo))
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="bad worktree",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="wt/blocked-worktree-test",
+        )
+        result = kb.dispatch_once(conn, spawn_fn=should_not_spawn, board="default")
+        task = kb.get_task(conn, t)
+        assert task is not None
+        events = kb.list_events(conn, t)
+        runs = kb.list_runs(conn, task_id=t)
+
+    assert result.spawned == []
+    assert result.auto_blocked == [t]
+    assert task.status == "blocked"
+    assert task.claim_lock is None
+    kinds = [event.kind for event in events]
+    assert "blocked" in kinds
+    assert "spawn_failed" not in kinds
+    assert "gave_up" not in kinds
+    assert runs[-1].outcome == "blocked"
+    assert "not a git worktree root" in (runs[-1].summary or "")
 
 
 # ---------------------------------------------------------------------------

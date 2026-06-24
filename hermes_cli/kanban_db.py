@@ -4684,6 +4684,155 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 # Workspace resolution
 # ---------------------------------------------------------------------------
 
+class WorktreeWorkspacePreflightError(ValueError):
+    """Worktree workspace is not spawn-safe and needs operator action."""
+
+
+def _git_toplevel(path: Path) -> Optional[Path]:
+    """Return git's top-level directory for ``path``, or None if not in git."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = (proc.stdout or "").strip()
+    if not out:
+        return None
+    return Path(out).expanduser().resolve()
+
+
+def _is_git_root(path: Path) -> bool:
+    top = _git_toplevel(path)
+    if top is None:
+        return False
+    try:
+        return top == path.expanduser().resolve()
+    except OSError:
+        return False
+
+
+def _git_branch_exists(repo_root: Path, branch: str) -> bool:
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def _validate_git_branch_name(repo_root: Path, branch: str) -> None:
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), "check-ref-format", "--branch", branch],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "invalid branch name").strip()
+        raise WorktreeWorkspacePreflightError(
+            f"invalid worktree branch {branch!r}: {detail}"
+        )
+
+
+def _worktree_source_repo(*, board: Optional[str]) -> Optional[Path]:
+    """Find the repo to use as the source for a Kanban worktree task."""
+    candidates: list[Path] = []
+    board_meta = read_board_metadata(board)
+    default_workdir = board_meta.get("default_workdir")
+    if default_workdir:
+        candidates.append(Path(str(default_workdir)).expanduser())
+    # Back-compat for older/default worktree tasks that relied on the
+    # dispatcher being launched from the source checkout.
+    candidates.append(Path.cwd())
+
+    for candidate in candidates:
+        top = _git_toplevel(candidate)
+        if top is not None:
+            return top
+    return None
+
+
+def _ensure_worktree_workspace(task: Task, path: Path, *, board: Optional[str]) -> Path:
+    """Ensure ``path`` is a git worktree/repo root, creating it when possible."""
+    p = path.expanduser()
+    if not p.is_absolute():
+        raise ValueError(
+            f"task {task.id} has non-absolute worktree path "
+            f"{task.workspace_path!r}; use an absolute path"
+        )
+
+    if p.exists():
+        if not p.is_dir():
+            raise WorktreeWorkspacePreflightError(
+                f"worktree path {p} exists but is not a directory; choose a missing/empty path or remove the file"
+            )
+        if _is_git_root(p):
+            return p
+        top = _git_toplevel(p)
+        if top is not None:
+            raise WorktreeWorkspacePreflightError(
+                f"worktree path {p} is inside git repo {top} but is not a git worktree root; "
+                "set workspace_path to the repository root"
+            )
+        try:
+            has_contents = any(p.iterdir())
+        except OSError as exc:
+            raise WorktreeWorkspacePreflightError(
+                f"cannot inspect worktree path {p}: {exc}"
+            ) from exc
+        if has_contents:
+            raise WorktreeWorkspacePreflightError(
+                f"worktree path {p} exists but is not a git worktree root; "
+                "move/remove it or choose a missing/empty path so the dispatcher can create a worktree"
+            )
+
+    source = _worktree_source_repo(board=board)
+    if source is None:
+        raise WorktreeWorkspacePreflightError(
+            f"worktree path {p} is missing/not a git worktree root and no source git repo is configured; "
+            "set the board default_workdir to the source repo or create the worktree manually"
+        )
+
+    branch = (task.branch_name or f"wt/{task.id}").strip()
+    _validate_git_branch_name(source, branch)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["git", "-C", str(source), "worktree", "add"]
+    if _git_branch_exists(source, branch):
+        cmd.extend([str(p), branch])
+    else:
+        cmd.extend(["-b", branch, str(p), "HEAD"])
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "git worktree add failed").strip()
+        raise WorktreeWorkspacePreflightError(
+            f"failed to create git worktree at {p} from {source}: {detail}"
+        )
+    if not _is_git_root(p):
+        raise WorktreeWorkspacePreflightError(
+            f"created worktree path {p} but it is not a git worktree root"
+        )
+    return p
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
@@ -4697,9 +4846,12 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
       resolves against the dispatcher's CWD instead of a meaningful
       root.  Users who want a kanban-root-relative workspace should
       compute the absolute path themselves.
-    - ``worktree``: a git worktree at ``workspace_path``.  Not created
-      automatically in v1 -- the kanban-worker skill documents
-      ``git worktree add`` as a worker-side step.  Returns the intended path.
+    - ``worktree``: a git worktree at ``workspace_path``.  If the path is
+      missing/empty and a source git checkout is available (board
+      ``default_workdir`` first, dispatcher CWD as back-compat), create a real
+      ``git worktree`` before spawn.  If the path exists but is not a git root,
+      raise a structured preflight error so dispatch can block instead of
+      entering a spawn_failed retry loop.
 
     Persist the resolved path back to the task row via ``set_workspace_path``
     so subsequent runs reuse the same directory.
@@ -4736,15 +4888,13 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         return p
     if kind == "worktree":
         if not task.workspace_path:
-            # Default: .worktrees/<id>/ under CWD.  Worker skill creates it.
-            return Path.cwd() / ".worktrees" / task.id
-        p = Path(task.workspace_path).expanduser()
-        if not p.is_absolute():
-            raise ValueError(
-                f"task {task.id} has non-absolute worktree path "
-                f"{task.workspace_path!r}; use an absolute path"
+            # Default: .worktrees/<id>/ under CWD, created from the current git
+            # checkout when possible.
+            return _ensure_worktree_workspace(
+                task, Path.cwd() / ".worktrees" / task.id, board=board
             )
-        return p
+        p = Path(task.workspace_path).expanduser()
+        return _ensure_worktree_workspace(task, p, board=board)
     raise ValueError(f"unknown workspace_kind: {kind}")
 
 
@@ -6284,6 +6434,11 @@ def dispatch_once(
             continue
         try:
             workspace = resolve_workspace(claimed, board=board)
+        except WorktreeWorkspacePreflightError as exc:
+            reason = f"workspace-preflight: {exc}"
+            if block_task(conn, claimed.id, reason=reason):
+                result.auto_blocked.append(claimed.id)
+            continue
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -6370,6 +6525,11 @@ def dispatch_once(
             continue
         try:
             workspace = resolve_workspace(claimed, board=board)
+        except WorktreeWorkspacePreflightError as exc:
+            reason = f"workspace-preflight: {exc}"
+            if block_task(conn, claimed.id, reason=reason):
+                result.auto_blocked.append(claimed.id)
+            continue
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
