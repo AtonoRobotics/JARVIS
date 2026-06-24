@@ -764,6 +764,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._model_name: str = self._resolve_model_name(
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
         )
+        self._voice_router_config: Dict[str, Any] = dict(extra.get("voice_router") or {})
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -1223,6 +1224,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "features": {
                 "chat_completions": True,
                 "chat_completions_streaming": True,
+                "voice_route": True,
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
@@ -1251,6 +1253,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
                 "models": {"method": "GET", "path": "/v1/models"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
+                "voice_route": {"method": "POST", "path": "/v1/voice/route"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
@@ -3730,6 +3733,309 @@ class APIServerAdapter(BasePlatformAdapter):
             self._inflight_agent_runs -= 1
 
     # ------------------------------------------------------------------
+    # /v1/voice/route — Home Assistant Voice PE routing
+    # ------------------------------------------------------------------
+
+    def _voice_fast_local_config(self) -> Dict[str, Any]:
+        """Return optional fast-local voice model config.
+
+        Config can be supplied under the API-server platform extra as
+        ``voice_router.fast_local``.  A future top-level config reader can be
+        layered in without changing the endpoint contract.
+        """
+        cfg = self._voice_router_config.get("fast_local")
+        if isinstance(cfg, dict):
+            return cfg
+        return {}
+
+    def _voice_fast_local_enabled(self) -> bool:
+        cfg = self._voice_fast_local_config()
+        if cfg:
+            return _coerce_request_bool(cfg.get("enabled"), default=False)
+        return os.getenv("HERMES_VOICE_FAST_LOCAL_ENABLED", "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+
+    async def _run_fast_local_voice(self, transcript: str) -> str:
+        """Run the optional local OpenAI-compatible voice model.
+
+        This path intentionally has no tools and a short timeout.  It is a
+        latency optimization, not an authority escalation path.
+        """
+        cfg = self._voice_fast_local_config()
+        base_url = str(
+            cfg.get("base_url")
+            or os.getenv("HERMES_VOICE_FAST_LOCAL_BASE_URL")
+            or "http://127.0.0.1:8002/v1"
+        ).rstrip("/")
+        model = str(
+            cfg.get("model")
+            or os.getenv("HERMES_VOICE_FAST_LOCAL_MODEL")
+            or "open-tester"
+        )
+        try:
+            timeout_seconds = float(cfg.get("timeout_seconds", 2.0))
+        except (TypeError, ValueError):
+            timeout_seconds = 2.0
+        try:
+            max_tokens = int(cfg.get("max_tokens", 80))
+        except (TypeError, ValueError):
+            max_tokens = 80
+
+        import aiohttp
+
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Answer in one concise spoken sentence.",
+                },
+                {"role": "user", "content": transcript},
+            ],
+            "temperature": 0.2,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=max(0.1, timeout_seconds))
+        ) as session:
+            async with session.post(f"{base_url}/chat/completions", json=payload) as resp:
+                if resp.status >= 400:
+                    text = await resp.text()
+                    raise RuntimeError(f"fast local voice model HTTP {resp.status}: {text[:200]}")
+                data = await resp.json()
+        return (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+
+    @staticmethod
+    def _voice_kanban_orchestrator_assignee() -> Optional[str]:
+        """Return the configured Kanban intake orchestrator profile, if any.
+
+        Complex voice work must not be created as ready/unassigned. Prefer the
+        explicit orchestrator profile; fall back to the dispatcher's default
+        assignee for older configs. If neither exists, the caller parks the card
+        in triage so it cannot strand as unassigned ready work.
+        """
+        try:
+            from hermes_cli.config import cfg_get, load_config
+
+            cfg = load_config()
+            for key in ("orchestrator_profile", "default_assignee"):
+                value = str(cfg_get(cfg, "kanban", key, default="") or "").strip()
+                if value:
+                    return value
+        except Exception:
+            logger.debug("Could not resolve Kanban voice orchestrator profile", exc_info=True)
+        return None
+
+    def _create_voice_kanban_task(
+        self,
+        decision: Any,
+        body: Dict[str, Any],
+        *,
+        gateway_session_key: Optional[str] = None,
+    ) -> str:
+        """Create a durable Kanban task for complex voice work."""
+        from hermes_cli import kanban_db as kb
+
+        transcript = str(body.get("transcript") or body.get("text") or "")
+        title = decision.task_title or transcript[:90] or "Voice-requested task"
+        assignee = self._voice_kanban_orchestrator_assignee()
+        metadata = {
+            "source": "homeassistant_voice_pe",
+            "trace_id": decision.trace_id,
+            "device_id": body.get("device_id"),
+            "satellite_id": body.get("satellite_id"),
+            "conversation_id": body.get("conversation_id"),
+            "session_key": gateway_session_key,
+            "routing_mode": "orchestrator_assignee" if assignee else "triage",
+            "routed_assignee": assignee,
+        }
+        body_text = (
+            (decision.task_body or "").rstrip()
+            + "\n\nMetadata:\n"
+            + json.dumps(metadata, indent=2, sort_keys=True)
+        )
+        idempotency_key = body.get("request_id") or body.get("idempotency_key") or None
+
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(
+                conn,
+                title=title,
+                body=body_text,
+                assignee=assignee,
+                created_by="ha_voice_router",
+                workspace_kind="scratch",
+                priority=0,
+                triage=assignee is None,
+                skills=["kanban-workflows", "voice-command-task-framing"],
+                idempotency_key=str(idempotency_key) if idempotency_key else None,
+                session_id=gateway_session_key,
+            )
+            if _coerce_request_bool(body.get("notify_homeassistant"), default=True):
+                try:
+                    kb.add_notify_sub(
+                        conn,
+                        task_id=task_id,
+                        platform="homeassistant",
+                        chat_id="event:hermes_tts",
+                        user_id="ha_voice_pe",
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not add HA Kanban notify subscription",
+                        exc_info=True,
+                    )
+            return task_id
+        finally:
+            conn.close()
+
+    def _create_voice_hil_task(
+        self,
+        decision: Any,
+        body: Dict[str, Any],
+        *,
+        gateway_session_key: Optional[str] = None,
+    ) -> str:
+        """Record a blocked HIL item for a boundary-crossing voice request."""
+        from hermes_cli import kanban_db as kb
+
+        transcript = str(body.get("transcript") or body.get("text") or "")
+        task_body = (
+            "Voice request blocked at authority boundary.\n\n"
+            f"Original transcript:\n{transcript}\n\n"
+            f"Reason:\n{decision.reason}\n\n"
+            "No external/destructive/authority-sensitive action was executed.\n"
+            "Requires explicit HIL approval before any follow-up execution.\n"
+        )
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(
+                conn,
+                title=f"HIL required: {transcript[:72] or 'voice request'}",
+                body=task_body,
+                assignee=None,
+                created_by="ha_voice_router",
+                workspace_kind="scratch",
+                session_id=gateway_session_key,
+            )
+            kb.block_task(
+                conn,
+                task_id,
+                reason="HIL required: voice request crossed an authority boundary",
+            )
+            return task_id
+        finally:
+            conn.close()
+
+    async def _handle_voice_route(self, request: "web.Request") -> "web.Response":
+        """POST /v1/voice/route — classify and route a HA voice transcript."""
+        from gateway.voice_router import VoiceRoute, classify_voice_request
+
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        started = time.time()
+        gateway_session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            return key_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        transcript = str(body.get("transcript") or body.get("text") or "").strip()
+        if not transcript:
+            return web.json_response(_openai_error("Missing 'transcript' field"), status=400)
+
+        decision = classify_voice_request(
+            transcript,
+            fast_local_enabled=self._voice_fast_local_enabled(),
+        )
+        task_id = None
+        run_id = None
+        usage = None
+        speech = decision.speech
+
+        if decision.route == VoiceRoute.KANBAN:
+            task_id = self._create_voice_kanban_task(
+                decision,
+                body,
+                gateway_session_key=gateway_session_key,
+            )
+        elif decision.route == VoiceRoute.HIL:
+            if decision.requires_hil:
+                task_id = self._create_voice_hil_task(
+                    decision,
+                    body,
+                    gateway_session_key=gateway_session_key,
+                )
+        elif decision.route == VoiceRoute.FAST_LOCAL:
+            try:
+                speech = await self._run_fast_local_voice(transcript)
+            except Exception as exc:
+                logger.warning("fast local voice route failed; falling back to agent: %s", exc)
+                result, usage = await self._run_agent(
+                    user_message=transcript,
+                    conversation_history=[],
+                    ephemeral_system_prompt=self._voice_system_prompt(body),
+                    session_id=body.get("conversation_id") or body.get("request_id"),
+                    gateway_session_key=gateway_session_key,
+                )
+                speech = (result.get("final_response") or "").strip()
+        elif decision.route == VoiceRoute.FAST_AGENT:
+            result, usage = await self._run_agent(
+                user_message=transcript,
+                conversation_history=[],
+                ephemeral_system_prompt=self._voice_system_prompt(body),
+                session_id=body.get("conversation_id") or body.get("request_id"),
+                gateway_session_key=gateway_session_key,
+            )
+            speech = (result.get("final_response") or "").strip()
+
+        if speech is None:
+            speech = ""
+        if not speech and decision.route not in {VoiceRoute.HA_NATIVE}:
+            speech = "Hermes did not return a spoken response."
+
+        response = decision.as_response(
+            conversation_id=body.get("conversation_id"),
+            continue_conversation=False,
+            task_id=task_id,
+            run_id=run_id,
+            speech=str(speech)[:1200],
+            latency_ms=int((time.time() - started) * 1000),
+        )
+        if usage is not None:
+            response["usage"] = usage
+        if gateway_session_key:
+            response["session_key"] = gateway_session_key
+        return web.json_response(response)
+
+    @staticmethod
+    def _voice_system_prompt(body: Dict[str, Any]) -> str:
+        extra = str(body.get("extra_system_prompt") or "").strip()
+        base = (
+            "You are Hermes Agent responding through Home Assistant Voice PE.\n"
+            "Reply in concise spoken form. Do not mention tools, JSON, APIs, "
+            "or internal routing.\n"
+            "Voice input is low-assurance; refuse or ask for explicit approval "
+            "for destructive, external, financial, deployment, or "
+            "authority-sensitive actions."
+        )
+        if extra:
+            return f"{base}\n\n{extra}"
+        return base
+
+    # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
     # ------------------------------------------------------------------
 
@@ -4341,6 +4647,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
+            self._app.router.add_post("/v1/voice/route", self._handle_voice_route)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
