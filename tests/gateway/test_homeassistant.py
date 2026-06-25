@@ -4,6 +4,7 @@ Tests real logic: state change formatting, event filtering pipeline,
 cooldown behavior, config integration, and adapter initialization.
 """
 
+import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -240,6 +241,92 @@ class TestAdapterInit:
         assert adapter._ignore_entities == set()
         assert adapter._watch_all is False
         assert adapter._cooldown_seconds == 30
+
+
+# ---------------------------------------------------------------------------
+# Outbound event delivery
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    status = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def text(self):
+        return ""
+
+
+class _FakeRestSession:
+    def __init__(self):
+        self.calls = []
+
+    def post(self, url, *, headers=None, json=None, timeout=None):
+        self.calls.append({
+            "url": url,
+            "headers": headers,
+            "json": json,
+            "timeout": timeout,
+        })
+        return _FakeResponse()
+
+
+class TestOutboundEventDelivery:
+    def test_event_chat_id_fires_ha_event(self):
+        async def run():
+            config = PlatformConfig(
+                enabled=True,
+                token="tok",
+                extra={"url": "http://ha.local:8123"},
+            )
+            adapter = HomeAssistantAdapter(config)
+            rest = _FakeRestSession()
+            adapter._rest_session = rest
+
+            result = await adapter.send(
+                "event:hermes_tts",
+                "hello from hermes",
+                metadata={"media_player_entity_id": "media_player.voice_preview"},
+            )
+
+            assert result.success is True
+            assert rest.calls[0]["url"] == "http://ha.local:8123/api/events/hermes_tts"
+            assert rest.calls[0]["json"] == {
+                "media_player_entity_id": "media_player.voice_preview",
+                "message": "hello from hermes",
+            }
+
+        asyncio.run(run())
+
+    def test_event_metadata_fires_ha_event(self):
+        async def run():
+            config = PlatformConfig(
+                enabled=True,
+                token="tok",
+                extra={"url": "http://ha.local:8123"},
+            )
+            adapter = HomeAssistantAdapter(config)
+            rest = _FakeRestSession()
+            adapter._rest_session = rest
+
+            await adapter.send(
+                "ignored",
+                "spoken reply",
+                metadata={
+                    "event_type": "hermes_tts",
+                    "thread_id": "not-for-ha-event",
+                    "message_thread_id": "not-for-ha-event",
+                },
+            )
+
+            assert rest.calls[0]["url"] == "http://ha.local:8123/api/events/hermes_tts"
+            assert rest.calls[0]["json"] == {"message": "spoken reply"}
+
+        asyncio.run(run())
 
 
 # ---------------------------------------------------------------------------
