@@ -131,6 +131,7 @@ class TestValidateSignature:
         req = _mock_request(headers={"X-Hub-Signature-256": sig})
         assert adapter._validate_signature(req, body, secret) is True
 
+
     def test_validate_github_signature_invalid(self):
         """Wrong X-Hub-Signature-256 is rejected."""
         adapter = _make_adapter()
@@ -1010,6 +1011,36 @@ class TestDeliverCrossPlatformThreadId:
         )
 
 
+class TestCrossPlatformDeliveryMetadata:
+    def test_deliver_cross_platform_passes_delivery_extra_metadata(self):
+        async def run():
+            adapter = _make_adapter()
+            target = AsyncMock()
+            target.send.return_value = SendResult(success=True)
+            adapter.gateway_runner = MagicMock()
+            adapter.gateway_runner.adapters = {Platform.HOMEASSISTANT: target}
+
+            result = await adapter._deliver_cross_platform(
+                "homeassistant",
+                "hello",
+                {
+                    "deliver_extra": {
+                        "chat_id": "event:hermes_tts",
+                        "media_player_entity_id": "media_player.voice_preview",
+                    }
+                },
+            )
+
+            assert result.success is True
+            target.send.assert_awaited_once_with(
+                "event:hermes_tts",
+                "hello",
+                metadata={"media_player_entity_id": "media_player.voice_preview"},
+            )
+
+        asyncio.run(run())
+
+
 class TestInsecureNoAuthSafetyRail:
     """connect() refuses to start when INSECURE_NO_AUTH is combined with a
     non-loopback bind. Guards against accidentally exposing an unauthenticated
@@ -1084,4 +1115,3 @@ class TestInsecureNoAuthSafetyRail:
             assert result is True
         finally:
             await adapter.disconnect()
-

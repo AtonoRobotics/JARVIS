@@ -395,6 +395,20 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         Uses the REST API instead of WebSocket to avoid a race condition
         with the event listener loop that reads from the same WS connection.
         """
+        metadata = metadata or {}
+        event_type = str(metadata.get("event_type") or "")
+        if not event_type and chat_id.startswith("event:"):
+            event_type = chat_id.split(":", 1)[1].strip()
+
+        if event_type:
+            payload = {
+                key: value
+                for key, value in metadata.items()
+                if key not in {"event_type", "thread_id", "message_thread_id"}
+            }
+            payload["message"] = content[:self.MAX_MESSAGE_LENGTH]
+            return await self._fire_event(event_type, payload)
+
         url = f"{self._hass_url}/api/services/persistent_notification/create"
         headers = {
             "Authorization": f"Bearer {self._hass_token}",
@@ -434,6 +448,43 @@ class HomeAssistantAdapter(BasePlatformAdapter):
 
         except asyncio.TimeoutError:
             return SendResult(success=False, error="Timeout sending notification to HA")
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+    async def _fire_event(self, event_type: str, payload: Dict[str, Any]) -> SendResult:
+        """Fire a Home Assistant event, used for webhook reply handoff."""
+        url = f"{self._hass_url}/api/events/{event_type}"
+        headers = {
+            "Authorization": f"Bearer {self._hass_token}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            if self._rest_session:
+                async with self._rest_session.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status < 300:
+                        return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+                    body = await resp.text()
+                    return SendResult(success=False, error=f"HTTP {resp.status}: {body}")
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status < 300:
+                        return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+                    body = await resp.text()
+                    return SendResult(success=False, error=f"HTTP {resp.status}: {body}")
+        except asyncio.TimeoutError:
+            return SendResult(success=False, error=f"Timeout firing HA event {event_type}")
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
